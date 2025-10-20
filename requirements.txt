@@ -1,1 +1,1 @@
-comtypes
+comtypes; sys_platform == "win32"
