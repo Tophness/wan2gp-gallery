@@ -345,10 +345,14 @@ class GalleryPlugin(WAN2GPPlugin):
         image_save_path = self.server_config.get("image_save_path", "outputs")
         paths = {save_path, image_save_path}
         all_files = []
+        
         for path in paths:
             if os.path.isdir(path) and os.path.exists(path):
-                valid_files = [f for f in os.listdir(path) if self.has_video_file_extension(f) or self.has_image_file_extension(f)]
-                all_files.extend([os.path.join(path, f) for f in valid_files])
+                for root, _, files in os.walk(path):
+                    for f in files:
+                        if self.has_video_file_extension(f) or self.has_image_file_extension(f):
+                            all_files.append(os.path.join(root, f))
+                            
         all_files.sort(key=os.path.getctime, reverse=True)
         thumbnails_dict = get_thumbnails_in_batch_windows([os.path.abspath(f) for f in all_files])
 
