@@ -8,6 +8,7 @@ import subprocess
 import json
 import hashlib
 import time
+import shutil
 
 from .gallery_utils import get_thumbnails_in_batch_windows
 
@@ -16,7 +17,10 @@ class GalleryPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.loaded_once = False
-        self.THUMB_CACHE_MAX_ENTRIES = 3000
+
+        self.settings = self._load_settings()
+
+        self.THUMB_CACHE_MAX_ENTRIES = self.settings.get("max_cache_entries", 3000)
         self._thumb_cache = {}
         self._scan_cache = {}
         self._disk_cache_initialized = False
@@ -26,6 +30,239 @@ class GalleryPlugin(WAN2GPPlugin):
         self._thumb_disk_index = {}
         self._thumb_disk_index_dirty = False
         self._thumb_disk_last_save_ts = 0.0
+
+        if self.settings.get("use_disk_cache", False) and self.settings.get("clean_on_startup", False):
+            self._ensure_disk_thumb_cache()
+            self._prune_thumb_cache()
+
+    def _get_settings_file_path(self):
+        plugin_base = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(plugin_base, "settings.json")
+
+    def _load_settings(self):
+        defaults = {
+            "use_disk_cache": False,
+            "max_cache_entries": 3000,
+            "clean_on_startup": False
+        }
+        settings_path = self._get_settings_file_path()
+        if os.path.isfile(settings_path):
+            try:
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    defaults.update(data)
+            except Exception as e:
+                print(f"[GalleryPlugin] Failed to read settings.json: {e}")
+        return defaults
+
+    def _save_settings(self):
+        settings_path = self._get_settings_file_path()
+        try:
+            with open(settings_path, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, indent=4)
+        except Exception as e:
+            print(f"[GalleryPlugin] Failed to save settings.json: {e}")
+
+    def _get_cache_dir_paths(self):
+        plugin_base = os.path.dirname(os.path.abspath(__file__))
+        cache_base = os.path.join(plugin_base, ".gallery_cache")
+        thumb_dir = os.path.join(cache_base, "thumbs")
+        index_file = os.path.join(cache_base, "thumb_index.json")
+        return cache_base, thumb_dir, index_file
+
+    def _ensure_disk_thumb_cache(self):
+        if self._disk_cache_initialized:
+            return
+        cache_base, thumb_dir, index_file = self._get_cache_dir_paths()
+        try:
+            os.makedirs(thumb_dir, exist_ok=True)
+        except Exception as e:
+            print(f"[GalleryPlugin] Could not create cache dir '{thumb_dir}': {e}")
+
+        self._thumb_disk_cache_root = cache_base
+        self._thumb_disk_dir = thumb_dir
+        self._thumb_index_file = index_file
+        self._thumb_disk_index = {}
+        self._thumb_disk_index_dirty = False
+
+        if os.path.exists(index_file):
+            try:
+                with open(index_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    for p, meta in data.items():
+                        if isinstance(meta, dict):
+                            key = meta.get("key")
+                            fn = meta.get("file")
+                            ts = meta.get("ts", 0)
+                            if isinstance(p, str) and isinstance(key, (list, tuple)) and len(key) == 2 and isinstance(fn, str):
+                                self._thumb_disk_index[p] = {
+                                    "key": [int(key[0]), int(key[1])],
+                                    "file": fn,
+                                    "ts": float(ts) if ts is not None else 0.0
+                                }
+            except Exception as e:
+                print(f"[GalleryPlugin] Could not load thumb cache index: {e}")
+                self._thumb_disk_index = {}
+        self._disk_cache_initialized = True
+
+    def _thumb_disk_file_name(self, abs_path: str) -> str:
+        h = hashlib.sha1(abs_path.encode("utf-8", errors="ignore")).hexdigest()
+        return f"{h}.b64"
+
+    def _save_thumb_disk_index(self, force=False):
+        if not self.settings.get("use_disk_cache", False):
+            return
+        self._ensure_disk_thumb_cache()
+        if not self._thumb_disk_index_dirty and not force:
+            return
+        now = time.time()
+        if (not force) and (now - self._thumb_disk_last_save_ts < 1.0):
+            return
+        try:
+            if self._thumb_index_file:
+                tmp = self._thumb_index_file + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(self._thumb_disk_index, f, ensure_ascii=False)
+                os.replace(tmp, self._thumb_index_file)
+                self._thumb_disk_last_save_ts = now
+                self._thumb_disk_index_dirty = False
+        except Exception as e:
+            print(f"[GalleryPlugin] Could not save thumb cache index: {e}")
+
+    def _disk_thumb_get(self, abs_path: str, sig):
+        if not self.settings.get("use_disk_cache", False):
+            return None
+        self._ensure_disk_thumb_cache()
+        if not sig:
+            return None
+        meta = self._thumb_disk_index.get(abs_path)
+        if not meta:
+            return None
+        cached_key = meta.get("key")
+        if not isinstance(cached_key, (list, tuple)) or len(cached_key) != 2:
+            return None
+        if [int(sig[0]), int(sig[1])] != [int(cached_key[0]), int(cached_key[1])]:
+            return None
+        fname = meta.get("file")
+        if not fname or not self._thumb_disk_dir:
+            return None
+        fpath = os.path.join(self._thumb_disk_dir, fname)
+        try:
+            if not os.path.exists(fpath):
+                return None
+            with open(fpath, "r", encoding="utf-8") as f:
+                thumb_b64 = f.read().strip()
+            if not thumb_b64:
+                return None
+            meta["ts"] = time.time()
+            self._thumb_disk_index_dirty = True
+            return thumb_b64
+        except Exception as e:
+            print(f"[GalleryPlugin] Could not read cached thumbnail '{fpath}': {e}")
+            return None
+
+    def _disk_thumb_put(self, abs_path: str, sig, thumb_b64: str):
+        if not self.settings.get("use_disk_cache", False):
+            return
+        self._ensure_disk_thumb_cache()
+        if not sig or not thumb_b64 or not self._thumb_disk_dir:
+            return
+        try:
+            fname = self._thumb_disk_file_name(abs_path)
+            fpath = os.path.join(self._thumb_disk_dir, fname)
+            tmp = fpath + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(thumb_b64)
+            os.replace(tmp, fpath)
+            self._thumb_disk_index[abs_path] = {
+                "key": [int(sig[0]), int(sig[1])],
+                "file": fname,
+                "ts": time.time(),
+            }
+            self._thumb_disk_index_dirty = True
+        except Exception as e:
+            print(f"[GalleryPlugin] Could not write cached thumbnail for '{abs_path}': {e}")
+
+    def _disk_thumb_delete(self, abs_path: str):
+        self._ensure_disk_thumb_cache()
+        meta = self._thumb_disk_index.pop(abs_path, None)
+        if meta:
+            self._thumb_disk_index_dirty = True
+            fname = meta.get("file")
+            if fname and self._thumb_disk_dir:
+                fpath = os.path.join(self._thumb_disk_dir, fname)
+                try:
+                    if os.path.exists(fpath):
+                        os.remove(fpath)
+                except Exception as e:
+                    print(f"[GalleryPlugin] Could not delete cached thumbnail '{fpath}': {e}")
+
+    def _prune_thumb_cache(self):
+        max_entries = int(self.settings.get("max_cache_entries", 3000))
+        if len(self._thumb_cache) > max_entries:
+            items = sorted(self._thumb_cache.items(), key=lambda kv: kv[1].get("ts", 0))
+            remove_count = len(self._thumb_cache) - max_entries
+            for i in range(remove_count):
+                try:
+                    p, _ = items[i]
+                    self._thumb_cache.pop(p, None)
+                except Exception:
+                    break
+
+        if self.settings.get("use_disk_cache", False):
+            self._ensure_disk_thumb_cache()
+            if len(self._thumb_disk_index) > max_entries:
+                items = sorted(self._thumb_disk_index.items(), key=lambda kv: (kv[1].get("ts", 0) if isinstance(kv[1], dict) else 0))
+                remove_count = len(self._thumb_disk_index) - max_entries
+                for i in range(remove_count):
+                    try:
+                        p, _ = items[i]
+                        self._disk_thumb_delete(p)
+                    except Exception:
+                        break
+            self._save_thumb_disk_index(force=False)
+
+    def _thumb_sig_from_path(self, path: str):
+        try:
+            st = os.stat(path)
+            mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
+            return (int(mtime_ns), int(st.st_size))
+        except Exception:
+            return None
+
+    def _get_cache_status_text(self):
+        if not self.settings.get("use_disk_cache", False):
+            return "*Disk Cache Status:* **Disabled** (Original Windows COM memory thumbnails only)"
+        cache_base, thumb_dir, _ = self._get_cache_dir_paths()
+        if not os.path.isdir(thumb_dir):
+            return "*Disk Cache Status:* **Empty** (0 files)"
+        try:
+            entries = os.listdir(thumb_dir)
+            count = len(entries)
+            total_bytes = sum(os.path.getsize(os.path.join(thumb_dir, f)) for f in entries if os.path.isfile(os.path.join(thumb_dir, f)))
+            mb = total_bytes / (1024 * 1024)
+            return f"*Disk Cache Status:* **Enabled** ({count} cached thumbnails, {mb:.1f} MB in `{cache_base}`)"
+        except Exception as e:
+            return f"*Disk Cache Status:* Error reading cache: {e}"
+
+    def clear_all_disk_cache(self):
+        cache_base, thumb_dir, index_file = self._get_cache_dir_paths()
+        try:
+            if os.path.isdir(thumb_dir):
+                shutil.rmtree(thumb_dir, ignore_errors=True)
+                os.makedirs(thumb_dir, exist_ok=True)
+            if os.path.isfile(index_file):
+                os.remove(index_file)
+        except Exception as e:
+            print(f"[GalleryPlugin] Error clearing disk cache: {e}")
+        self._thumb_cache.clear()
+        self._scan_cache.clear()
+        self._thumb_disk_index = {}
+        self._thumb_disk_index_dirty = False
+        self._disk_cache_initialized = False
+        return self._get_cache_status_text()
 
     def setup_ui(self):
         self.add_tab(
@@ -70,10 +307,13 @@ class GalleryPlugin(WAN2GPPlugin):
     def _get_roots(self):
         save_path = os.path.abspath(self.server_config.get("save_path", "outputs"))
         image_save_path = os.path.abspath(self.server_config.get("image_save_path", "outputs"))
+        audio_save_path = os.path.abspath(self.server_config.get("audio_save_path", save_path))
         roots = []
-        for p in [save_path, image_save_path]:
+        for p in [save_path, image_save_path, audio_save_path]:
             if p and os.path.isdir(p) and p not in roots:
                 roots.append(p)
+        if not roots:
+            roots = [os.path.abspath("outputs")]
         return roots
 
     def _is_within_roots(self, path: str, roots=None) -> bool:
@@ -86,411 +326,6 @@ class GalleryPlugin(WAN2GPPlugin):
             except Exception:
                 pass
         return False
-
-    def _thumb_sig_from_path(self, path: str):
-        try:
-            st = os.stat(path)
-            mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))
-            return (int(mtime_ns), int(st.st_size))
-        except Exception:
-            return None
-
-    def _get_plugin_base_dir(self):
-        try:
-            return os.path.dirname(os.path.abspath(__file__))
-        except Exception:
-            return os.path.abspath(".")
-
-    def _ensure_disk_thumb_cache(self):
-        if self._disk_cache_initialized:
-            return
-        try:
-            plugin_base = self._get_plugin_base_dir()
-        except Exception:
-            plugin_base = os.path.abspath(".")
-        cache_base = os.path.join(plugin_base, ".gallery_cache")
-        thumb_dir = os.path.join(cache_base, "thumbs")
-        index_file = os.path.join(cache_base, "thumb_index.json")
-        try:
-            os.makedirs(thumb_dir, exist_ok=True)
-        except Exception as e:
-            print(f"Could not create gallery cache dir '{thumb_dir}': {e}")
-        self._thumb_disk_cache_root = cache_base
-        self._thumb_disk_dir = thumb_dir
-        self._thumb_index_file = index_file
-        self._thumb_disk_index = {}
-        self._thumb_disk_index_dirty = False
-        try:
-            if os.path.exists(index_file):
-                with open(index_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    for p, meta in data.items():
-                        if isinstance(meta, dict):
-                            key = meta.get("key")
-                            fn = meta.get("file")
-                            ts = meta.get("ts", 0)
-                            if isinstance(p, str) and isinstance(key, (list, tuple)) and len(key) == 2 and isinstance(fn, str):
-                                self._thumb_disk_index[p] = {
-                                    "key": [int(key[0]), int(key[1])],
-                                    "file": fn,
-                                    "ts": float(ts) if ts is not None else 0.0
-                                }
-        except Exception as e:
-            print(f"Could not load gallery thumb cache index: {e}")
-            self._thumb_disk_index = {}
-        self._disk_cache_initialized = True
-
-    def _thumb_disk_file_name(self, abs_path: str) -> str:
-        h = hashlib.sha1(abs_path.encode("utf-8", errors="ignore")).hexdigest()
-        return f"{h}.b64"
-
-    def _save_thumb_disk_index(self, force=False):
-        self._ensure_disk_thumb_cache()
-        if not self._thumb_disk_index_dirty and not force:
-            return
-        now = time.time()
-        if (not force) and (now - self._thumb_disk_last_save_ts < 1.0):
-            return
-        try:
-            if self._thumb_index_file:
-                tmp = self._thumb_index_file + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(self._thumb_disk_index, f, ensure_ascii=False)
-                os.replace(tmp, self._thumb_index_file)
-                self._thumb_disk_last_save_ts = now
-                self._thumb_disk_index_dirty = False
-        except Exception as e:
-            print(f"Could not save gallery thumb cache index: {e}")
-
-    def _disk_thumb_get(self, abs_path: str, sig):
-        self._ensure_disk_thumb_cache()
-        if not sig:
-            return None
-        meta = self._thumb_disk_index.get(abs_path)
-        if not meta:
-            return None
-        cached_key = meta.get("key")
-        if not isinstance(cached_key, (list, tuple)) or len(cached_key) != 2:
-            return None
-        if [int(sig[0]), int(sig[1])] != [int(cached_key[0]), int(cached_key[1])]:
-            return None
-        fname = meta.get("file")
-        if not fname or not self._thumb_disk_dir:
-            return None
-        fpath = os.path.join(self._thumb_disk_dir, fname)
-        try:
-            if not os.path.exists(fpath):
-                return None
-            with open(fpath, "r", encoding="utf-8") as f:
-                thumb_b64 = f.read().strip()
-            if not thumb_b64:
-                return None
-            meta["ts"] = time.time()
-            self._thumb_disk_index_dirty = True
-            return thumb_b64
-        except Exception as e:
-            print(f"Could not read cached thumbnail '{fpath}': {e}")
-            return None
-
-    def _disk_thumb_put(self, abs_path: str, sig, thumb_b64: str):
-        self._ensure_disk_thumb_cache()
-        if not sig or not thumb_b64 or not self._thumb_disk_dir:
-            return
-        try:
-            fname = self._thumb_disk_file_name(abs_path)
-            fpath = os.path.join(self._thumb_disk_dir, fname)
-            tmp = fpath + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write(thumb_b64)
-            os.replace(tmp, fpath)
-            self._thumb_disk_index[abs_path] = {
-                "key": [int(sig[0]), int(sig[1])],
-                "file": fname,
-                "ts": time.time(),
-            }
-            self._thumb_disk_index_dirty = True
-        except Exception as e:
-            print(f"Could not write cached thumbnail for '{abs_path}': {e}")
-
-    def _disk_thumb_delete(self, abs_path: str):
-        self._ensure_disk_thumb_cache()
-        meta = self._thumb_disk_index.pop(abs_path, None)
-        if meta:
-            self._thumb_disk_index_dirty = True
-            fname = meta.get("file")
-            if fname and self._thumb_disk_dir:
-                fpath = os.path.join(self._thumb_disk_dir, fname)
-                try:
-                    if os.path.exists(fpath):
-                        os.remove(fpath)
-                except Exception as e:
-                    print(f"Could not delete cached thumbnail '{fpath}': {e}")
-
-    def _prune_thumb_cache(self):
-        if len(self._thumb_cache) > self.THUMB_CACHE_MAX_ENTRIES:
-            items = sorted(self._thumb_cache.items(), key=lambda kv: kv[1].get("ts", 0))
-            remove_count = len(self._thumb_cache) - self.THUMB_CACHE_MAX_ENTRIES
-            for i in range(remove_count):
-                try:
-                    p, _ = items[i]
-                    self._thumb_cache.pop(p, None)
-                except Exception:
-                    break
-        self._ensure_disk_thumb_cache()
-        if len(self._thumb_disk_index) > self.THUMB_CACHE_MAX_ENTRIES:
-            items = sorted(self._thumb_disk_index.items(), key=lambda kv: (kv[1].get("ts", 0) if isinstance(kv[1], dict) else 0))
-            remove_count = len(self._thumb_disk_index) - self.THUMB_CACHE_MAX_ENTRIES
-            for i in range(remove_count):
-                try:
-                    p, _ = items[i]
-                    self._disk_thumb_delete(p)
-                except Exception:
-                    break
-        self._save_thumb_disk_index(force=False)
-
-    def _invalidate_scan_cache_for_dir(self, dir_path: str):
-        self._scan_cache.pop(os.path.abspath(dir_path), None)
-
-    def _scan_dir_non_recursive_cached(self, dir_path: str, force_refresh=False, incremental_refresh=False):
-        dir_abs = os.path.abspath(dir_path)
-        if (not force_refresh) and (dir_abs in self._scan_cache):
-            cached = self._scan_cache.get(dir_abs, {"folders": [], "files": []})
-            return {"folders": list(cached.get("folders", [])), "files": list(cached.get("files", []))}
-        old = self._scan_cache.get(dir_abs, {"folders": [], "files": []})
-        old_files_set = set(old.get("files", []))
-        folders = []
-        files = []
-        seen_folders = set()
-        try:
-            entries = os.listdir(dir_abs)
-        except Exception as e:
-            print(f"Could not list dir {dir_abs}: {e}")
-            self._scan_cache[dir_abs] = {"folders": [], "files": []}
-            return {"folders": [], "files": []}
-        for name in entries:
-            full = os.path.abspath(os.path.join(dir_abs, name))
-            try:
-                if os.path.isdir(full):
-                    if full not in seen_folders:
-                        seen_folders.add(full)
-                        folders.append({"path": full, "name": name})
-            except Exception:
-                continue
-        for name in entries:
-            full = os.path.abspath(os.path.join(dir_abs, name))
-            try:
-                if os.path.isfile(full) and (
-                    self.has_video_file_extension(name)
-                    or self.has_image_file_extension(name)
-                    or self.has_audio_file_extension(name)
-                ):
-                    files.append(full)
-            except Exception:
-                continue
-        if incremental_refresh:
-            new_files_set = set(files)
-            deleted_files = old_files_set - new_files_set
-            for p in deleted_files:
-                self._thumb_cache.pop(p, None)
-                self._disk_thumb_delete(p)
-            for p in new_files_set:
-                cached_thumb = self._thumb_cache.get(p)
-                current_sig = self._thumb_sig_from_path(p)
-                if cached_thumb and ((not current_sig) or (cached_thumb.get("key") != current_sig)):
-                    self._thumb_cache.pop(p, None)
-                disk_meta = self._thumb_disk_index.get(p) if self._disk_cache_initialized else None
-                if disk_meta and current_sig:
-                    dkey = disk_meta.get("key")
-                    if not (isinstance(dkey, (list, tuple)) and len(dkey) == 2 and [int(dkey[0]), int(dkey[1])] == [int(current_sig[0]), int(current_sig[1])]):
-                        self._disk_thumb_delete(p)
-                elif disk_meta and not current_sig:
-                    self._disk_thumb_delete(p)
-        self._scan_cache[dir_abs] = {"folders": folders, "files": files}
-        return {"folders": list(folders), "files": list(files)}
-
-    def _get_thumbnails_cached(self, file_paths, priority_paths=None):
-        result = {}
-        priority_set = set(priority_paths or [])
-        priority_misses = []
-        normal_misses = []
-        for p in file_paths:
-            sig = self._thumb_sig_from_path(p)
-            if not sig:
-                continue
-            cached = self._thumb_cache.get(p)
-            if cached and cached.get("key") == sig and cached.get("thumb"):
-                cached["ts"] = time.time()
-                result[p] = cached["thumb"]
-                continue
-            disk_thumb = self._disk_thumb_get(p, sig)
-            if disk_thumb:
-                self._thumb_cache[p] = {"key": sig, "thumb": disk_thumb, "ts": time.time()}
-                result[p] = disk_thumb
-                continue
-            if p in priority_set:
-                priority_misses.append(p)
-            else:
-                normal_misses.append(p)
-        to_generate = priority_misses + normal_misses
-        if to_generate:
-            generated = get_thumbnails_in_batch_windows(to_generate) or {}
-            for p in to_generate:
-                thumb = generated.get(p)
-                if thumb:
-                    sig = self._thumb_sig_from_path(p)
-                    if sig:
-                        now = time.time()
-                        self._thumb_cache[p] = {"key": sig, "thumb": thumb, "ts": now}
-                        self._disk_thumb_put(p, sig, thumb)
-                        result[p] = thumb
-        self._prune_thumb_cache()
-        return result
-
-    def _build_gallery_listing(self, current_dir="", force_refresh=False, incremental_refresh=False):
-        roots = self._get_roots()
-        cur = (current_dir or "").strip()
-        cur_abs = os.path.abspath(cur) if cur else ""
-        if cur_abs and (not os.path.isdir(cur_abs) or not self._is_within_roots(cur_abs, roots)):
-            cur_abs = ""
-        folder_items = []
-        file_items = []
-        seen_files = set()
-        seen_folders = set()
-
-        def add_folder(folder_path: str, display: str):
-            ap = os.path.abspath(folder_path)
-            if ap in seen_folders:
-                return
-            seen_folders.add(ap)
-            folder_items.append({"path": ap, "name": display})
-
-        def add_file(file_path: str):
-            ap = os.path.abspath(file_path)
-            if ap in seen_files:
-                return
-            seen_files.add(ap)
-            file_items.append(ap)
-
-        if not cur_abs:
-            for r in roots:
-                scan = self._scan_dir_non_recursive_cached(r, force_refresh=force_refresh, incremental_refresh=incremental_refresh)
-                for fo in scan["folders"]:
-                    add_folder(fo["path"], fo["name"])
-                for f in scan["files"]:
-                    add_file(f)
-        else:
-            parent = os.path.abspath(os.path.join(cur_abs, os.pardir))
-            if parent and parent != cur_abs and self._is_within_roots(parent, roots):
-                add_folder(parent, "⬆️ ..")
-            scan = self._scan_dir_non_recursive_cached(cur_abs, force_refresh=force_refresh, incremental_refresh=incremental_refresh)
-            for fo in scan["folders"]:
-                add_folder(fo["path"], fo["name"])
-            for f in scan["files"]:
-                add_file(f)
-
-        folder_items.sort(key=lambda x: x["name"].lower())
-        try:
-            file_items.sort(key=os.path.getctime, reverse=True)
-        except Exception:
-            file_items.sort(reverse=True)
-
-        thumb_targets = [p for p in file_items if self.has_video_file_extension(p) or self.has_image_file_extension(p)]
-        visible_total_slots = 36
-        visible_file_slots = max(0, visible_total_slots - len(folder_items))
-        priority_thumb_targets = thumb_targets[:visible_file_slots]
-        thumbnails_dict = self._get_thumbnails_cached(thumb_targets, priority_paths=priority_thumb_targets)
-
-        return {
-            "roots": roots,
-            "cur_abs": cur_abs,
-            "folder_items": folder_items,
-            "file_items": file_items,
-            "thumbnails_dict": thumbnails_dict,
-        }
-
-    def _render_gallery_from_listing(self, listing):
-        cur_abs = listing["cur_abs"]
-        folder_items = listing["folder_items"]
-        file_items = listing["file_items"]
-        thumbnails_dict = listing["thumbnails_dict"]
-        items_html = ""
-
-        for fo in folder_items:
-            fpath = fo["path"]
-            display_name = fo["name"]
-            safe_path = json.dumps(fpath, ensure_ascii=False)
-            items_html += f"""
-            <div class="gallery-item gallery-folder" data-path={safe_path} ondblclick="openGalleryFolder(event, this)">
-                <div class="gallery-item-thumbnail" style="display:flex;align-items:center;justify-content:center;font-size:42px;">
-                    📁
-                </div>
-                <div class="gallery-item-name" title="{display_name}">{display_name}</div>
-            </div>
-            """
-
-        for f in file_items:
-            basename = os.path.basename(f)
-            display_name = basename
-            match = re.search(r'_seed\d+_(.+)\.(mp4|jpg|jpeg|png|webp|wav|mp3|flac|ogg|m4a|aac)$', basename, re.IGNORECASE)
-            if match:
-                display_name = match.group(1)
-            is_video = self.has_video_file_extension(f)
-            is_audio = self.has_audio_file_extension(f)
-            base64_thumb = thumbnails_dict.get(os.path.abspath(f))
-            if is_audio:
-                thumbnail_html = """
-                    <div style="font-size:42px;line-height:1;display:flex;align-items:center;justify-content:center;height:100%;">
-                        🔊
-                    </div>
-                """
-            else:
-                thumbnail_html = (
-                    f'<img src="data:image/jpeg;base64,{base64_thumb}" alt="thumb">'
-                    if base64_thumb else
-                    (f'<video muted preload="metadata" src="/gradio_api/file={f}#t=0.5"></video>'
-                     if is_video
-                     else f'<img src="/gradio_api/file={f}" alt="thumb">')
-                )
-            safe_path = json.dumps(f, ensure_ascii=False)
-            items_html += f"""
-            <div class="gallery-item" data-path={safe_path} onclick="selectGalleryItem(event, this)">
-                <div class="gallery-item-thumbnail">{thumbnail_html}</div>
-                <div class="gallery-item-name" title="{basename}">{display_name}</div>
-            </div>
-            """
-
-        full_html = f"<div class='gallery-grid'>{items_html}</div>"
-
-        clear_metadata_html = """
-        <div class='metadata-content'>
-            <p class='placeholder'>Select a file to view its metadata.</p>
-        </div>
-        """
-
-        return {
-            self.gallery_html_output: full_html,
-            self.selected_files_for_backend: "",
-            self.metadata_panel_output: clear_metadata_html,
-            self.join_videos_btn: gr.Button(visible=False),
-            self.recreate_join_btn: gr.Button(visible=False),
-            self.send_to_generator_settings_btn: gr.Button(visible=False),
-            self.preview_row: gr.Column(visible=False),
-            self.video_preview: gr.Video(value=None, visible=False),
-            self.image_preview: gr.Image(value=None, visible=False),
-            self.audio_preview: gr.Audio(value=None, visible=False),
-            self.frame_preview_row: gr.Row(visible=False),
-            self.first_frame_preview: gr.Image(value=None),
-            self.last_frame_preview: gr.Image(value=None),
-            self.join_interface: gr.Column(visible=False),
-            self.merge_info_display: gr.Column(visible=False),
-            self.current_frame_buttons_row: gr.Row(visible=False),
-            self.current_gallery_dir: cur_abs if cur_abs else ""
-        }
-
-    def refresh_gallery_files(self, current_state, current_dir=""):
-        listing = self._build_gallery_listing(current_dir=current_dir, force_refresh=True, incremental_refresh=True)
-        return self._render_gallery_from_listing(listing)
 
     def create_gallery_ui(self):
         css = """
@@ -511,37 +346,77 @@ class GalleryPlugin(WAN2GPPlugin):
             }
             #metadata-panel-container {
                 flex: 1;
+                max-height: 80vh;
+                overflow-y: auto;
                 border: 1px solid var(--border-color-primary);
                 padding: 15px;
                 background-color: var(--background-fill-primary);
                 border-radius: 8px;
+                display: flex;
+                flex-direction: column;
+                justify-content: flex-start;
             }
 
-            .gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 16px; }
+            .gallery-breadcrumbs {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                padding: 8px 12px;
+                margin-bottom: 12px;
+                background-color: var(--background-fill-primary);
+                border: 1px solid var(--border-color-primary);
+                border-radius: 6px;
+                font-size: 13px;
+                overflow-x: auto;
+                white-space: nowrap;
+            }
+            .breadcrumb-item {
+                cursor: pointer;
+                color: var(--primary-500);
+                font-weight: 500;
+                text-decoration: underline;
+            }
+            .breadcrumb-item:hover {
+                color: var(--primary-600);
+            }
+            .breadcrumb-separator {
+                color: var(--body-text-color-subdued);
+            }
+            .breadcrumb-current {
+                font-weight: 600;
+                color: var(--body-text-color);
+            }
+
+            .gallery-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+                gap: 14px;
+            }
             .gallery-item {
                 position: relative;
                 cursor: pointer;
-                border: 2px solid transparent;
+                border: 2px solid var(--border-color-primary);
                 border-radius: 8px;
                 overflow: hidden;
-                aspect-ratio: 4 / 5;
                 display: flex;
                 flex-direction: column;
                 background-color: var(--background-fill-primary);
-                transition: all 0.2s ease-in-out;
-                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+                transition: all 0.18s ease-in-out;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.08);
             }
             .gallery-item:hover {
-                border-color: var(--border-color-accent);
+                border-color: var(--primary-400);
                 transform: translateY(-2px);
+                box-shadow: 0 4px 8px rgba(0,0,0,0.12);
             }
             .gallery-item.selected {
                 border-color: var(--primary-500);
-                box-shadow: 0 0 0 3px var(--primary-200);
+                box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.3);
             }
             .gallery-item-thumbnail {
-                flex-grow: 1;
-                background-color: var(--panel-background-fill);
+                width: 100%;
+                height: 125px;
+                background-color: var(--background-fill-secondary);
                 display: flex;
                 align-items: center;
                 justify-content: center;
@@ -553,32 +428,26 @@ class GalleryPlugin(WAN2GPPlugin):
                 object-fit: contain;
             }
             .gallery-item-name {
-                padding: 4px 8px;
-                font-size: 12px;
+                padding: 6px 8px;
+                font-size: 11px;
+                font-family: var(--font, system-ui, -apple-system, sans-serif);
+                line-height: 1.35;
                 text-align: center;
-                background-color: var(--panel-background-fill);
+                background-color: var(--background-fill-primary);
                 color: var(--body-text-color);
-                white-space: normal;
-                word-break: break-word;
+                overflow-wrap: break-word;
+                word-break: normal;
                 border-top: 1px solid var(--border-color-primary);
-                min-height: 3.2em;
-                display: flex;
-                align-items: center;
-                justify-content: center;
+                min-height: 2.7em;
+                max-height: 3.8em;
+                overflow: hidden;
+                display: -webkit-box;
+                -webkit-line-clamp: 2;
+                -webkit-box-orient: vertical;
             }
             .metadata-content {
-                font-family: monospace;
-                font-size: 13px;
-                line-height: 1.6;
-                word-wrap: break-word;
-            }
-            .metadata-content b {
-                color: var(--primary-500);
-            }
-            .metadata-content hr {
-                border: 0;
-                border-top: 1px solid var(--border-color-primary);
-                margin: 8px 0;
+                width: 100%;
+                font-family: var(--font, system-ui, -apple-system, sans-serif);
             }
             .metadata-content .placeholder {
                 color: var(--body-text-color-subdued);
@@ -586,12 +455,47 @@ class GalleryPlugin(WAN2GPPlugin):
                 margin-top: 20px;
                 font-style: italic;
             }
-            #video_info, #video_info TR, #video_info TD {
-                background-color: transparent;
-                color: inherit;
-                padding: 4px;
-                border: 0px !important;
+            #video_info {
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 8px;
+                font-family: var(--font, system-ui, -apple-system, sans-serif);
+            }
+            #video_info tr {
+                border: none !important;
+                background: transparent !important;
+            }
+            #video_info td {
+                padding: 5px 6px;
+                border: none !important;
                 font-size: 12px;
+                line-height: 1.4;
+                vertical-align: top;
+            }
+            #video_info td.label-cell {
+                text-align: right;
+                width: 1%;
+                white-space: nowrap;
+                color: var(--body-text-color-subdued);
+                font-weight: 500;
+                padding-right: 12px;
+            }
+            #video_info td.value-cell {
+                text-align: left;
+                word-break: break-word;
+                overflow-wrap: anywhere;
+                color: var(--body-text-color);
+            }
+            #video_info td.value-cell b {
+                color: var(--body-text-color);
+                font-weight: 600;
+            }
+            .frame-preview-header {
+                font-size: 12px;
+                font-weight: 600;
+                text-align: center;
+                margin-bottom: 4px;
+                color: var(--body-text-color-subdued);
             }
             #custom-button {
                 font-size: 13px;
@@ -600,15 +504,48 @@ class GalleryPlugin(WAN2GPPlugin):
             #stop-button:hover {
                 background: #ff3333 !important;
             }
+            #settings-panel {
+                border: 1px solid var(--border-color-primary);
+                background-color: var(--background-fill-secondary);
+                border-radius: 8px;
+                padding: 12px;
+                margin-bottom: 12px;
+            }
+            #delete-confirm-box {
+                border: 1px solid #ff4444;
+                background-color: rgba(255, 68, 68, 0.08);
+                border-radius: 8px;
+                padding: 10px;
+                margin-bottom: 12px;
+            }
         """
 
         js = """
             function() {
+                function setGradioInputValue(elem, val) {
+                    if (!elem) return;
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value'
+                    )?.set;
+                    const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLTextAreaElement.prototype, 'value'
+                    )?.set;
+                    if (elem.tagName === 'INPUT' && nativeInputValueSetter) {
+                        nativeInputValueSetter.call(elem, val);
+                    } else if (elem.tagName === 'TEXTAREA' && nativeTextAreaValueSetter) {
+                        nativeTextAreaValueSetter.call(elem, val);
+                    } else {
+                        elem.value = val;
+                    }
+                    elem.dispatchEvent(new Event('input', { bubbles: true }));
+                    elem.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+
                 window.selectGalleryItem = function(event, element) {
                     if (element.classList.contains('gallery-folder')) return;
 
                     const gallery = element.closest('.gallery-grid');
-                    const selectedFilesInput = document.querySelector('#selected-files-backend textarea');
+                    const selectedFilesInput = document.querySelector('#selected-files-backend input, #selected-files-backend textarea');
                     if (!gallery || !selectedFilesInput) { return; }
                     if (!event.ctrlKey && !event.metaKey) {
                         gallery.querySelectorAll('.gallery-item.selected').forEach(el => {
@@ -618,26 +555,24 @@ class GalleryPlugin(WAN2GPPlugin):
                     element.classList.toggle('selected');
                     const selectedItems = Array.from(gallery.querySelectorAll('.gallery-item.selected'));
                     const selectedPaths = selectedItems.map(el => el.dataset.path);
-                    selectedFilesInput.value = selectedPaths.join('||');
-                    selectedFilesInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    setGradioInputValue(selectedFilesInput, selectedPaths.join('||'));
+                };
+
+                window.openGalleryFolderByPath = function(targetPath) {
+                    const dirInput = document.querySelector('#current-gallery-dir input, #current-gallery-dir textarea');
+                    const selectedFilesInput = document.querySelector('#selected-files-backend input, #selected-files-backend textarea');
+                    if (!dirInput) return;
+                    setGradioInputValue(dirInput, targetPath || "");
+                    if (selectedFilesInput) {
+                        setGradioInputValue(selectedFilesInput, "");
+                    }
                 };
 
                 window.openGalleryFolder = function(event, element) {
                     event.preventDefault();
                     event.stopPropagation();
-
-                    const dirInput = document.querySelector('#current-gallery-dir textarea');
-                    const selectedFilesInput = document.querySelector('#selected-files-backend textarea');
-                    if (!dirInput) return;
-
                     const targetPath = element.dataset.path;
-                    dirInput.value = targetPath || "";
-                    dirInput.dispatchEvent(new Event('input', { bubbles: true }));
-
-                    if (selectedFilesInput) {
-                        selectedFilesInput.value = "";
-                        selectedFilesInput.dispatchEvent(new Event('input', { bubbles: true }));
-                    }
+                    window.openGalleryFolderByPath(targetPath);
                 };
 
                 function setupVideoFrameSeeker(containerId, sliderId, fps) {
@@ -699,15 +634,6 @@ class GalleryPlugin(WAN2GPPlugin):
                     sliderContainer.addEventListener('mouseup', handleInteractionEnd);
                     sliderContainer.addEventListener('touchend', handleInteractionEnd);
                 }
-
-                window.captureCurrentVideoTime = function(videoId, hiddenInputId) {
-                    const video = document.querySelector(`#${videoId} video`);
-                    const hiddenInput = document.querySelector(`#${hiddenInputId} textarea`);
-                    if (video && hiddenInput) {
-                        hiddenInput.value = video.currentTime.toString();
-                        hiddenInput.dispatchEvent(new Event('input', { bubbles: true }));
-                    }
-                };
 
                 function setupScopedObserver(observerName, rootSelector, targetSelector, callback) {
                     if (!window.scopedObservers) {
@@ -773,8 +699,44 @@ class GalleryPlugin(WAN2GPPlugin):
             gallery_blocks.load(fn=None, js=js)
             with gr.Column(elem_id="gallery_tab_container"):
                 with gr.Row():
-                    self.refresh_gallery_files_btn = gr.Button("Refresh Files")
-                    self.delete_files_btn = gr.Button("Delete selected File", elem_id="stop-button")
+                    self.refresh_gallery_files_btn = gr.Button("🔄 Refresh Files", scale=2)
+                    self.settings_toggle_btn = gr.Button("⚙️ Settings", scale=1)
+                    self.delete_files_btn = gr.Button("🗑️ Delete Selected", elem_id="stop-button", scale=2)
+                    self.delete_all_btn = gr.Button("⚠️ Delete All", elem_id="stop-button", scale=1)
+
+                with gr.Row(visible=False, elem_id="delete-confirm-box") as self.delete_all_confirm_row:
+                    with gr.Column():
+                        self.delete_all_msg_md = gr.Markdown("⚠️ **Are you sure you want to delete ALL files in this folder view? This action cannot be undone!**")
+                        with gr.Row():
+                            self.confirm_delete_all_btn = gr.Button("Yes, Delete All", variant="stop")
+                            self.cancel_delete_all_btn = gr.Button("Cancel", variant="secondary")
+
+                self.settings_visible_state = gr.State(False)
+                with gr.Column(visible=False, elem_id="settings-panel") as self.settings_panel:
+                    gr.Markdown("#### ⚙️ Gallery & Cache Settings")
+                    with gr.Row():
+                        self.setting_use_disk_cache = gr.Checkbox(
+                            label="Enable Thumbnail Disk Cache",
+                            value=self.settings.get("use_disk_cache", False),
+                            info="Caches base64 thumbnails in plugin/.gallery_cache to speed up reloads. Disable if you prefer zero SSD writes."
+                        )
+                        self.setting_clean_on_startup = gr.Checkbox(
+                            label="Auto-clean Cache on Startup",
+                            value=self.settings.get("clean_on_startup", False),
+                            info="Prunes and removes orphaned thumbnails when WanGP launches."
+                        )
+                    with gr.Row():
+                        self.setting_max_cache_entries = gr.Slider(
+                            label="Max Disk Cache Entries",
+                            minimum=500,
+                            maximum=10000,
+                            step=500,
+                            value=self.settings.get("max_cache_entries", 3000),
+                            interactive=True
+                        )
+                        self.clear_cache_btn = gr.Button("🗑️ Clear Disk Cache Now", variant="secondary")
+                    self.cache_status_info = gr.Markdown(value=self._get_cache_status_text())
+
                 with gr.Row(elem_id="gallery-layout"):
                     self.gallery_html_output = gr.HTML(
                         value="<div class='gallery-grid'><p class='placeholder'>Click 'Refresh Files' to load gallery.</p></div>",
@@ -792,8 +754,13 @@ class GalleryPlugin(WAN2GPPlugin):
                                 self.use_as_end_btn = gr.Button("as End-Image ⬆️", variant="primary", elem_id="custom-button")
                                 self.send_to_generator_settings_btn = gr.Button("Use Settings in Generator", interactive=False, visible=False)
                             with gr.Row(visible=False) as self.frame_preview_row:
-                                self.first_frame_preview = gr.Image(label="First Frame", interactive=False, height=150)
-                                self.last_frame_preview = gr.Image(label="Last Frame", interactive=False, height=150)
+                                with gr.Column(scale=1, min_width=90):
+                                    gr.Markdown("<div class='frame-preview-header'>First Frame</div>")
+                                    self.first_frame_preview = gr.Image(show_label=False, interactive=False, height=135, show_download_button=False, container=False)
+                                with gr.Column(scale=1, min_width=90):
+                                    gr.Markdown("<div class='frame-preview-header'>Last Frame</div>")
+                                    self.last_frame_preview = gr.Image(show_label=False, interactive=False, height=135, show_download_button=False, container=False)
+
                         self.metadata_panel_output = gr.HTML(value="<div class='metadata-content'><p class='placeholder'>Select a file to view its metadata.</p></div>")
                         with gr.Column(visible=False) as self.merge_info_display:
                             gr.Markdown("--- \n #### Merged From")
@@ -832,6 +799,7 @@ class GalleryPlugin(WAN2GPPlugin):
             self.selected_files_for_backend,
             self.metadata_panel_output,
             self.join_videos_btn,
+            self.recreate_join_btn,
             self.send_to_generator_settings_btn,
             self.preview_row,
             self.video_preview,
@@ -841,10 +809,10 @@ class GalleryPlugin(WAN2GPPlugin):
             self.first_frame_preview,
             self.last_frame_preview,
             self.join_interface,
-            self.recreate_join_btn,
             self.merge_info_display,
             self.current_frame_buttons_row,
             self.current_gallery_dir,
+            self.delete_all_confirm_row
         ]
         no_updates = {comp: gr.update() for comp in outputs_list}
 
@@ -863,8 +831,7 @@ class GalleryPlugin(WAN2GPPlugin):
         self.refresh_gallery_files_btn.click(
             fn=self.refresh_gallery_files,
             inputs=[self.state, self.current_gallery_dir],
-            outputs=outputs_list,
-            show_progress="hidden"
+            outputs=outputs_list
         )
 
         self.current_gallery_dir.change(
@@ -879,6 +846,79 @@ class GalleryPlugin(WAN2GPPlugin):
             inputs=[self.selected_files_for_backend, self.state, self.current_gallery_dir],
             outputs=outputs_list,
             show_progress="hidden"
+        )
+
+        self.delete_all_btn.click(
+            fn=lambda: gr.update(visible=True),
+            inputs=None,
+            outputs=self.delete_all_confirm_row
+        )
+        self.cancel_delete_all_btn.click(
+            fn=lambda: gr.update(visible=False),
+            inputs=None,
+            outputs=self.delete_all_confirm_row
+        )
+        self.confirm_delete_all_btn.click(
+            fn=self.delete_all_files_in_folder,
+            inputs=[self.state, self.current_gallery_dir],
+            outputs=outputs_list,
+            show_progress="hidden"
+        )
+
+        def toggle_settings_panel(is_visible):
+            new_vis = not bool(is_visible)
+            return new_vis, gr.update(visible=new_vis), self._get_cache_status_text()
+
+        self.settings_toggle_btn.click(
+            fn=toggle_settings_panel,
+            inputs=[self.settings_visible_state],
+            outputs=[self.settings_visible_state, self.settings_panel, self.cache_status_info]
+        )
+
+        def on_use_disk_cache_change(val):
+            self.settings["use_disk_cache"] = bool(val)
+            self._save_settings()
+            return self._get_cache_status_text()
+
+        self.setting_use_disk_cache.change(
+            fn=on_use_disk_cache_change,
+            inputs=[self.setting_use_disk_cache],
+            outputs=[self.cache_status_info]
+        )
+
+        def on_clean_startup_change(val):
+            self.settings["clean_on_startup"] = bool(val)
+            self._save_settings()
+
+        self.setting_clean_on_startup.change(
+            fn=on_clean_startup_change,
+            inputs=[self.setting_clean_on_startup],
+            outputs=None
+        )
+
+        def on_max_entries_change(val):
+            self.settings["max_cache_entries"] = int(val)
+            self.THUMB_CACHE_MAX_ENTRIES = int(val)
+            self._save_settings()
+            if self.settings.get("use_disk_cache", False):
+                self._prune_thumb_cache()
+            return self._get_cache_status_text()
+
+        self.setting_max_cache_entries.change(
+            fn=on_max_entries_change,
+            inputs=[self.setting_max_cache_entries],
+            outputs=[self.cache_status_info]
+        )
+
+        def on_clear_cache_click():
+            status = self.clear_all_disk_cache()
+            gr.Info("Disk thumbnail cache has been cleared.")
+            return status
+
+        self.clear_cache_btn.click(
+            fn=on_clear_cache_click,
+            inputs=None,
+            outputs=[self.cache_status_info]
         )
 
         self.selected_files_for_backend.change(
@@ -972,14 +1012,12 @@ class GalleryPlugin(WAN2GPPlugin):
         return gallery_blocks
 
     def use_current_frame_as_start(self, video_path_with_time):
-        print(f"Debug: video_path_with_time={video_path_with_time}")
         if not video_path_with_time or '|||' not in video_path_with_time:
             gr.Warning("No video selected or invalid data.")
             return gr.update(), gr.update(), gr.update(), gr.update()
         try:
             video_path, current_time_str = video_path_with_time.split('|||')
             current_time = float(current_time_str)
-            print(f"Debug parsed: video_path={video_path}, time={current_time}")
             fps, _, _, _ = self.get_video_info(video_path)
             frame_number = int(current_time * fps)
             current_frame = self.get_video_frame(video_path, frame_number, return_PIL=True)
@@ -992,20 +1030,16 @@ class GalleryPlugin(WAN2GPPlugin):
             }
         except Exception as e:
             print(f"Error in use_current_frame_as_start: {e}")
-            import traceback
-            traceback.print_exc()
             gr.Warning(f"Error extracting frame: {e}")
             return gr.update(), gr.update(), gr.update(), gr.update()
 
     def use_current_frame_as_end(self, video_path_with_time):
-        print(f"Debug: video_path_with_time={video_path_with_time}")
         if not video_path_with_time or '|||' not in video_path_with_time:
             gr.Warning("No video selected or invalid data.")
             return gr.update(), gr.update(), gr.update(), gr.update()
         try:
             video_path, current_time_str = video_path_with_time.split('|||')
             current_time = float(current_time_str)
-            print(f"Debug parsed: video_path={video_path}, time={current_time}")
             fps, _, _, _ = self.get_video_info(video_path)
             frame_number = int(current_time * fps)
             current_frame = self.get_video_frame(video_path, frame_number, return_PIL=True)
@@ -1018,8 +1052,6 @@ class GalleryPlugin(WAN2GPPlugin):
             }
         except Exception as e:
             print(f"Error in use_current_frame_as_end: {e}")
-            import traceback
-            traceback.print_exc()
             gr.Warning(f"Error extracting frame: {e}")
             return gr.update(), gr.update(), gr.update(), gr.update()
 
@@ -1042,25 +1074,23 @@ class GalleryPlugin(WAN2GPPlugin):
                     self._disk_thumb_delete(abs_file)
                     os.remove(file_path)
                     deleted_count += 1
+
                     base_path = os.path.splitext(file_path)[0]
-                    metadata_extensions = ['.txt', '.json', '.metadata']
-                    for ext in metadata_extensions:
-                        metadata_path = base_path + ext
-                        if os.path.exists(metadata_path):
+                    for ext in ['.txt', '.json', '.metadata']:
+                        meta_path = base_path + ext
+                        if os.path.exists(meta_path):
                             try:
-                                os.remove(metadata_path)
-                            except Exception as e:
-                                print(f"Could not delete metadata file {metadata_path}: {e}")
+                                os.remove(meta_path)
+                            except Exception:
+                                pass
                 else:
                     failed_count += 1
-                    print(f"File not found: {file_path}")
             except Exception as e:
                 failed_count += 1
                 print(f"Error deleting file {file_path}: {e}")
 
         for d in touched_dirs:
-            self._invalidate_scan_cache_for_dir(d)
-
+            self._scan_cache.pop(d, None)
         self._save_thumb_disk_index(force=True)
 
         if deleted_count > 0:
@@ -1070,9 +1100,317 @@ class GalleryPlugin(WAN2GPPlugin):
 
         return self.refresh_gallery_files(current_state, current_dir)
 
+    def delete_all_files_in_folder(self, current_state, current_dir=""):
+        roots = self._get_roots()
+        cur = (current_dir or "").strip()
+        cur_abs = os.path.abspath(cur) if cur else ""
+        target_dirs = [cur_abs] if cur_abs and self._is_within_roots(cur_abs, roots) else roots
+
+        deleted_count = 0
+        failed_count = 0
+        touched_dirs = set()
+
+        for d in target_dirs:
+            if not os.path.isdir(d):
+                continue
+            touched_dirs.add(os.path.abspath(d))
+            try:
+                entries = os.listdir(d)
+            except Exception as e:
+                print(f"Could not list dir {d}: {e}")
+                continue
+
+            for name in entries:
+                full_path = os.path.join(d, name)
+                if os.path.isfile(full_path) and (
+                    self.has_video_file_extension(name)
+                    or self.has_image_file_extension(name)
+                    or self.has_audio_file_extension(name)
+                ):
+                    try:
+                        abs_file = os.path.abspath(full_path)
+                        self._thumb_cache.pop(abs_file, None)
+                        self._disk_thumb_delete(abs_file)
+                        os.remove(full_path)
+                        deleted_count += 1
+
+                        base_path = os.path.splitext(full_path)[0]
+                        for ext in ['.txt', '.json', '.metadata']:
+                            meta_path = base_path + ext
+                            if os.path.exists(meta_path):
+                                try:
+                                    os.remove(meta_path)
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        failed_count += 1
+                        print(f"Could not delete {full_path}: {e}")
+
+        for d in touched_dirs:
+            self._scan_cache.pop(d, None)
+        self._save_thumb_disk_index(force=True)
+
+        if deleted_count > 0:
+            gr.Info(f"Deleted {deleted_count} file(s) in current folder.")
+        else:
+            gr.Info("No files found to delete.")
+        if failed_count > 0:
+            gr.Warning(f"Failed to delete {failed_count} file(s).")
+
+        res = self.refresh_gallery_files(current_state, current_dir)
+        res[self.delete_all_confirm_row] = gr.update(visible=False)
+        return res
+
+    def refresh_gallery_files(self, current_state, current_dir=""):
+        if current_dir:
+            self._scan_cache.pop(os.path.abspath(current_dir), None)
+        else:
+            for r in self._get_roots():
+                self._scan_cache.pop(r, None)
+        return self.list_output_files_as_html(current_state, current_dir)
+
+    def _build_breadcrumbs_html(self, cur_abs, roots):
+        if not cur_abs:
+            return """
+            <div class="gallery-breadcrumbs">
+                <span class="breadcrumb-current">🏠 Root (Outputs)</span>
+            </div>
+            """
+
+        matching_root = None
+        for r in roots:
+            try:
+                if os.path.commonpath([cur_abs, r]) == r:
+                    matching_root = r
+                    break
+            except Exception:
+                pass
+
+        if not matching_root:
+            matching_root = roots[0] if roots else ""
+
+        root_label = os.path.basename(matching_root) or "Root"
+        html_code = f"""<div class="gallery-breadcrumbs">
+            <span class="breadcrumb-item" onclick="openGalleryFolderByPath('')">🏠 Root ({root_label})</span>"""
+
+        rel = os.path.relpath(cur_abs, matching_root) if matching_root else ""
+        if rel and rel != ".":
+            parts = rel.replace("\\", "/").split("/")
+            accum = matching_root
+            for idx, part in enumerate(parts):
+                accum = os.path.join(accum, part)
+                is_last = (idx == len(parts) - 1)
+                safe_accum = json.dumps(accum, ensure_ascii=False)
+                html_code += f""" <span class="breadcrumb-separator">/</span> """
+                if is_last:
+                    html_code += f"""<span class="breadcrumb-current">{part}</span>"""
+                else:
+                    html_code += f"""<span class="breadcrumb-item" onclick='openGalleryFolderByPath({safe_accum})'>{part}</span>"""
+
+        html_code += "</div>"
+        return html_code
+
     def list_output_files_as_html(self, current_state, current_dir=""):
-        listing = self._build_gallery_listing(current_dir=current_dir, force_refresh=False, incremental_refresh=False)
-        return self._render_gallery_from_listing(listing)
+        roots = self._get_roots()
+        cur = (current_dir or "").strip()
+        cur_abs = os.path.abspath(cur) if cur else ""
+        if cur_abs and (not os.path.isdir(cur_abs) or not self._is_within_roots(cur_abs, roots)):
+            cur_abs = ""
+
+        folder_items = []
+        file_items = []
+        seen_files = set()
+        seen_folders = set()
+
+        def add_folder(folder_path: str, display: str):
+            ap = os.path.abspath(folder_path)
+            if ap in seen_folders:
+                return
+            seen_folders.add(ap)
+            folder_items.append({"path": ap, "name": display})
+
+        def add_file(file_path: str):
+            ap = os.path.abspath(file_path)
+            if ap in seen_files:
+                return
+            seen_files.add(ap)
+            file_items.append(ap)
+
+        use_disk_cache = self.settings.get("use_disk_cache", False)
+
+        def scan_dir(dir_path: str):
+            if use_disk_cache and dir_path in self._scan_cache:
+                cached = self._scan_cache[dir_path]
+                for fo in cached.get("folders", []):
+                    add_folder(fo["path"], fo["name"])
+                for f in cached.get("files", []):
+                    add_file(f)
+                return
+
+            try:
+                entries = os.listdir(dir_path)
+            except Exception as e:
+                print(f"Could not list dir {dir_path}: {e}")
+                return
+
+            curr_folders = []
+            curr_files = []
+
+            for name in entries:
+                full = os.path.join(dir_path, name)
+                if os.path.isdir(full):
+                    curr_folders.append({"path": os.path.abspath(full), "name": name})
+                    add_folder(full, name)
+
+            for name in entries:
+                full = os.path.join(dir_path, name)
+                if os.path.isfile(full) and (
+                    self.has_video_file_extension(name)
+                    or self.has_image_file_extension(name)
+                    or self.has_audio_file_extension(name)
+                ):
+                    abs_f = os.path.abspath(full)
+                    curr_files.append(abs_f)
+                    add_file(full)
+
+            if use_disk_cache:
+                self._scan_cache[dir_path] = {"folders": curr_folders, "files": curr_files}
+
+        if not cur_abs:
+            for r in roots:
+                scan_dir(r)
+        else:
+            parent = os.path.abspath(os.path.join(cur_abs, os.pardir))
+            if parent and parent != cur_abs and self._is_within_roots(parent, roots):
+                add_folder(parent, "⬆️ ..")
+            scan_dir(cur_abs)
+
+        folder_items.sort(
+            key=lambda x: (
+                0 if (x["name"].startswith("⬆️") or x["name"] == "..") else 1,
+                x["name"].lower()
+            )
+        )
+        try:
+            file_items.sort(key=os.path.getctime, reverse=True)
+        except Exception:
+            file_items.sort(reverse=True)
+
+        thumb_targets = [
+            p for p in file_items
+            if self.has_video_file_extension(p) or self.has_image_file_extension(p)
+        ]
+
+        if use_disk_cache:
+            thumbnails_dict = {}
+            to_generate = []
+            for p in thumb_targets:
+                sig = self._thumb_sig_from_path(p)
+                if not sig:
+                    continue
+                cached = self._thumb_cache.get(p)
+                if cached and cached.get("key") == sig and cached.get("thumb"):
+                    cached["ts"] = time.time()
+                    thumbnails_dict[p] = cached["thumb"]
+                    continue
+                disk_thumb = self._disk_thumb_get(p, sig)
+                if disk_thumb:
+                    self._thumb_cache[p] = {"key": sig, "thumb": disk_thumb, "ts": time.time()}
+                    thumbnails_dict[p] = disk_thumb
+                    continue
+                to_generate.append(p)
+
+            if to_generate:
+                generated = get_thumbnails_in_batch_windows(to_generate) or {}
+                for p in to_generate:
+                    thumb = generated.get(p)
+                    if thumb:
+                        sig = self._thumb_sig_from_path(p)
+                        if sig:
+                            now = time.time()
+                            self._thumb_cache[p] = {"key": sig, "thumb": thumb, "ts": now}
+                            self._disk_thumb_put(p, sig, thumb)
+                            thumbnails_dict[p] = thumb
+
+            self._prune_thumb_cache()
+            self._save_thumb_disk_index(force=False)
+        else:
+            thumbnails_dict = get_thumbnails_in_batch_windows(thumb_targets) or {}
+
+        breadcrumbs_html = self._build_breadcrumbs_html(cur_abs, roots)
+        items_html = ""
+
+        for fo in folder_items:
+            fpath = fo["path"]
+            display_name = fo["name"]
+            safe_path = json.dumps(fpath, ensure_ascii=False)
+            items_html += f"""
+            <div class="gallery-item gallery-folder" data-path={safe_path} onclick="openGalleryFolder(event, this)" title="Click to open {display_name}">
+                <div class="gallery-item-thumbnail" style="display:flex;align-items:center;justify-content:center;font-size:42px;">
+                    📁
+                </div>
+                <div class="gallery-item-name" title="{display_name}">{display_name}</div>
+            </div>
+            """
+
+        for f in file_items:
+            basename = os.path.basename(f)
+            display_name = basename
+            match = re.search(r'_seed\d+_(.+)\.(mp4|jpg|jpeg|png|webp|wav|mp3|flac|ogg|m4a|aac)$',
+                              basename, re.IGNORECASE)
+            if match:
+                display_name = match.group(1)
+
+            is_video = self.has_video_file_extension(f)
+            is_audio = self.has_audio_file_extension(f)
+            base64_thumb = thumbnails_dict.get(os.path.abspath(f)) or thumbnails_dict.get(f)
+
+            if is_audio:
+                thumbnail_html = """
+                    <div style="font-size:42px;line-height:1;display:flex;align-items:center;justify-content:center;height:100%;">
+                        🔊
+                    </div>
+                """
+            else:
+                thumbnail_html = (
+                    f'<img src="data:image/jpeg;base64,{base64_thumb}" alt="thumb">'
+                    if base64_thumb else
+                    (f'<video muted preload="metadata" src="/gradio_api/file={f}#t=0.5"></video>'
+                     if is_video
+                     else f'<img src="/gradio_api/file={f}" alt="thumb">')
+                )
+
+            safe_path = json.dumps(f, ensure_ascii=False)
+            items_html += f"""
+            <div class="gallery-item" data-path={safe_path} onclick="selectGalleryItem(event, this)">
+                <div class="gallery-item-thumbnail">{thumbnail_html}</div>
+                <div class="gallery-item-name" title="{basename}">{display_name}</div>
+            </div>
+            """
+
+        full_html = f"{breadcrumbs_html}<div class='gallery-grid'>{items_html}</div>"
+        clear_metadata_html = "<div class='metadata-content'><p class='placeholder'>Select a file to view its metadata.</p></div>"
+
+        return {
+            self.gallery_html_output: full_html,
+            self.selected_files_for_backend: "",
+            self.metadata_panel_output: clear_metadata_html,
+            self.join_videos_btn: gr.Button(visible=False),
+            self.recreate_join_btn: gr.Button(visible=False),
+            self.send_to_generator_settings_btn: gr.Button(visible=False),
+            self.preview_row: gr.Column(visible=False),
+            self.video_preview: gr.Video(value=None, visible=False),
+            self.image_preview: gr.Image(value=None, visible=False),
+            self.audio_preview: gr.Audio(value=None, visible=False),
+            self.frame_preview_row: gr.Row(visible=False),
+            self.first_frame_preview: gr.Image(value=None),
+            self.last_frame_preview: gr.Image(value=None),
+            self.join_interface: gr.Column(visible=False),
+            self.merge_info_display: gr.Column(visible=False),
+            self.current_frame_buttons_row: gr.Row(visible=False),
+            self.current_gallery_dir: cur_abs if cur_abs else "",
+            self.delete_all_confirm_row: gr.Row(visible=False)
+        }
 
     def add_merge_info_to_metadata(self, configs, plugin_data, **kwargs):
         if plugin_data and "merge_info" in plugin_data:
@@ -1102,6 +1440,7 @@ class GalleryPlugin(WAN2GPPlugin):
                     duration = float(fmt["duration"])
                 except Exception:
                     duration = None
+
             out = {}
             if duration is not None:
                 out["duration_s"] = duration
@@ -1128,7 +1467,6 @@ class GalleryPlugin(WAN2GPPlugin):
 
     def get_audio_info_html(self, file_path: str) -> str:
         values, labels = [os.path.basename(file_path)], ["File Name"]
-
         creation_date = str(self.get_file_creation_date(file_path))
         values.append(creation_date[:creation_date.rfind('.')])
         labels.append("Creation Date")
@@ -1163,11 +1501,10 @@ class GalleryPlugin(WAN2GPPlugin):
                 labels.append("Bitrate")
 
         rows = [
-            f"<TR><TD style='text-align: right; vertical-align: top; width:1%; white-space:nowrap;'>{l}</TD>"
-            f"<TD><B>{v}</B></TD></TR>"
+            f"<TR><TD class='label-cell'>{l}</TD><TD class='value-cell'><B>{v}</B></TD></TR>"
             for l, v in zip(labels, values) if v is not None
         ]
-        return f"<TABLE ID=video_info WIDTH=100%>{''.join(rows)}</TABLE>"
+        return f"<TABLE ID=video_info>{''.join(rows)}</TABLE>"
 
     def get_video_info_html(self, current_state, file_path):
         configs, _, _ = self.get_settings_from_file(current_state, file_path, False, False, False)
@@ -1211,7 +1548,9 @@ class GalleryPlugin(WAN2GPPlugin):
         else:
             values.extend(misc_values)
             labels.extend(misc_labels)
-            values.append(configs.get("prompt", "")[:1024])
+            prompt = str(configs.get("prompt", "") or "")[:2048]
+            prompt = prompt.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+            values.append(prompt)
             labels.append("Text Prompt")
             values.extend([
                 f"{configs.get('resolution', '')} (real: {width}x{height})",
@@ -1222,10 +1561,10 @@ class GalleryPlugin(WAN2GPPlugin):
             ])
             labels.extend(["Resolution", "Video Length", "Seed", "Guidance (CFG)", "Num Inference steps"])
         rows = [
-            f"<TR><TD style='text-align: right; vertical-align: top; width:1%; white-space:nowrap;'>{l}</TD><TD><B>{v}</B></TD></TR>"
+            f"<TR><TD class='label-cell'>{l}</TD><TD class='value-cell'><B>{v}</B></TD></TR>"
             for l, v in zip(labels, values) if v is not None
         ]
-        return f"<TABLE ID=video_info WIDTH=100%>{''.join(rows)}</TABLE>"
+        return f"<TABLE ID=video_info>{''.join(rows)}</TABLE>"
 
     def update_metadata_panel_and_buttons(self, selection_str, current_state):
         file_paths = selection_str.split('||') if selection_str else []
@@ -1283,9 +1622,12 @@ class GalleryPlugin(WAN2GPPlugin):
                     p1 = (c1.get('prompt', 'N/A') if c1 else 'N/A')
                     p2 = (c2.get('prompt', 'N/A') if c2 else 'N/A')
 
-                    updates[self.merge_source1_prompt] = f"<b>{vid1_rel} (Frame {f1_num})</b><br>{p1[:100] + '...' if len(p1) > 100 else p1}"
+                    p1_escaped = p1.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+                    p2_escaped = p2.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+
+                    updates[self.merge_source1_prompt] = f"<b>{vid1_rel} (Frame {f1_num})</b><br>{p1_escaped[:100] + '...' if len(p1_escaped) > 100 else p1_escaped}"
                     updates[self.merge_source1_image] = f1_pil
-                    updates[self.merge_source2_prompt] = f"<b>{vid2_rel} (Frame {f2_num})</b><br>{p2[:100] + '...' if len(p2) > 100 else p2}"
+                    updates[self.merge_source2_prompt] = f"<b>{vid2_rel} (Frame {f2_num})</b><br>{p2_escaped[:100] + '...' if len(p2_escaped) > 100 else p2_escaped}"
                     updates[self.merge_source2_image] = f2_pil
                 else:
                     updates[self.preview_row] = gr.Column(visible=True)
@@ -1311,11 +1653,10 @@ class GalleryPlugin(WAN2GPPlugin):
 
                     updates[self.first_frame_preview] = gr.Image(
                         value=first_frame_pil,
-                        label="First Frame"
+                        visible=True
                     )
                     updates[self.last_frame_preview] = gr.Image(
                         value=last_frame_pil,
-                        label="Last Frame",
                         visible=True
                     )
 
@@ -1327,7 +1668,6 @@ class GalleryPlugin(WAN2GPPlugin):
                     )
                     updates[self.video_preview] = gr.Video(visible=False, value=None)
                     updates[self.audio_preview] = gr.Audio(visible=False, value=None)
-
                     updates[self.current_frame_buttons_row] = gr.Row(visible=False)
                     updates[self.frame_preview_row] = gr.Row(visible=False)
                     updates[self.current_selected_video_path] = ""
@@ -1339,7 +1679,6 @@ class GalleryPlugin(WAN2GPPlugin):
                     )
                     updates[self.video_preview] = gr.Video(visible=False, value=None)
                     updates[self.image_preview] = gr.Image(visible=False, value=None)
-
                     updates[self.current_frame_buttons_row] = gr.Row(visible=False)
                     updates[self.frame_preview_row] = gr.Row(visible=False)
                     updates[self.current_selected_video_path] = ""
@@ -1480,4 +1819,3 @@ class GalleryPlugin(WAN2GPPlugin):
             self.image_prompt_type_endcheckbox: gr.Checkbox(value=True),
             self.plugin_data: {"merge_info": merge_info}
         }
-    
