@@ -288,6 +288,7 @@ class GalleryPlugin(WAN2GPPlugin):
         self.request_global("generate_dropdown_model_list")
         self.request_global("get_unique_id")
         self.request_global("args")
+        self.request_global("get_lora_local_path")
         self.request_component("main")
         self.request_component("state")
         self.request_component("main_tabs")
@@ -1465,7 +1466,69 @@ class GalleryPlugin(WAN2GPPlugin):
             print(f"ffprobe audio error: {e}")
             return {}
 
-    def get_audio_info_html(self, file_path: str) -> str:
+    def _format_lora_name(self, lora: str) -> str:
+        if hasattr(self, "get_lora_local_path") and callable(self.get_lora_local_path):
+            try:
+                res = self.get_lora_local_path(None, lora)
+                if res:
+                    return str(res)
+            except Exception:
+                pass
+        if not isinstance(lora, str):
+            return str(lora)
+        lora = lora.strip()
+        if lora.startswith("http://") or lora.startswith("https://"):
+            parts = lora.split("|")
+            base = os.path.basename(parts[0])
+            if len(parts) > 1 and parts[1].strip():
+                return os.path.join(parts[1].strip(), base)
+            return base
+        return os.path.basename(lora)
+
+    def _format_loras_display(self, configs: dict) -> str:
+        if not isinstance(configs, dict):
+            return ""
+        loras = configs.get("activated_loras") or configs.get("transformer_loras_filenames") or []
+        if isinstance(loras, str):
+            loras = [loras]
+        if not loras:
+            return ""
+
+        raw_mult = configs.get("loras_multipliers") or configs.get("transformer_loras_multipliers") or ""
+        mult_list = []
+        if isinstance(raw_mult, list):
+            mult_list = [str(m) for m in raw_mult]
+        elif isinstance(raw_mult, str) and raw_mult.strip():
+            for line in raw_mult.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                mult_list.extend(line.replace(",", " ").split())
+
+        mult_list = list(mult_list) + ["1.0"] * max(0, len(loras) - len(mult_list))
+
+        items_html = []
+        for lora, mult in zip(loras, mult_list):
+            lora_name = self._format_lora_name(lora)
+            m_str = str(mult).strip() if mult is not None else ""
+            if not m_str:
+                m_str = "1.0"
+            if not (m_str.startswith("x") or m_str.startswith("X")):
+                m_str = f"x{m_str}"
+            safe_name = lora_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            safe_mult = m_str.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            items_html.append(
+                f"<div style='display:flex; justify-content:space-between; align-items:flex-start; gap:8px;'>"
+                f"<span style='overflow-wrap:anywhere; word-break:break-word;'>{safe_name}</span>"
+                f"<span style='white-space:nowrap; opacity:0.85; font-weight:normal;'>{safe_mult}</span>"
+                f"</div>"
+            )
+
+        if not items_html:
+            return ""
+        return f"<div style='display:flex; flex-direction:column; gap:3px;'>{''.join(items_html)}</div>"
+
+    def get_audio_info_html(self, file_path: str, current_state=None) -> str:
         values, labels = [os.path.basename(file_path)], ["File Name"]
         creation_date = str(self.get_file_creation_date(file_path))
         values.append(creation_date[:creation_date.rfind('.')])
@@ -1500,6 +1563,14 @@ class GalleryPlugin(WAN2GPPlugin):
                     values.append(str(info["bit_rate"]))
                 labels.append("Bitrate")
 
+        if current_state is not None and hasattr(self, "get_settings_from_file"):
+            configs, _, _ = self.get_settings_from_file(current_state, file_path, False, False, False)
+            if configs:
+                loras_display = self._format_loras_display(configs)
+                if loras_display:
+                    values.append(loras_display)
+                    labels.append("LoRAs")
+
         rows = [
             f"<TR><TD class='label-cell'>{l}</TD><TD class='value-cell'><B>{v}</B></TD></TR>"
             for l, v in zip(labels, values) if v is not None
@@ -1528,6 +1599,9 @@ class GalleryPlugin(WAN2GPPlugin):
             if configs.get("film_grain_intensity", 0) > 0:
                 pp_values.append(f"Intensity={configs['film_grain_intensity']}, Saturation={configs['film_grain_saturation']}")
                 pp_labels.append("Film Grain")
+
+        loras_display = self._format_loras_display(configs) if configs else ""
+
         if configs is None or "seed" not in configs:
             values.extend(misc_values)
             labels.extend(misc_labels)
@@ -1545,6 +1619,9 @@ class GalleryPlugin(WAN2GPPlugin):
                 labels.append("Nb Audio Tracks")
             values.extend(pp_values)
             labels.extend(pp_labels)
+            if loras_display:
+                values.append(loras_display)
+                labels.append("LoRAs")
         else:
             values.extend(misc_values)
             labels.extend(misc_labels)
@@ -1560,6 +1637,15 @@ class GalleryPlugin(WAN2GPPlugin):
                 configs.get('num_inference_steps', 'N/A')
             ])
             labels.extend(["Resolution", "Video Length", "Seed", "Guidance (CFG)", "Num Inference steps"])
+            if loras_display:
+                values.append(loras_display)
+                labels.append("LoRAs")
+            values.extend(pp_values)
+            labels.extend(pp_labels)
+            creation_date = str(self.get_file_creation_date(file_path))
+            values.append(creation_date[:creation_date.rfind('.')])
+            labels.append("Creation Date")
+
         rows = [
             f"<TR><TD class='label-cell'>{l}</TD><TD class='value-cell'><B>{v}</B></TD></TR>"
             for l, v in zip(labels, values) if v is not None
@@ -1599,7 +1685,7 @@ class GalleryPlugin(WAN2GPPlugin):
             configs, _, _ = self.get_settings_from_file(current_state, file_path, False, False, False)
             updates[self.send_to_generator_settings_btn] = gr.Button(visible=True, interactive=bool(configs))
             if self.has_audio_file_extension(file_path):
-                updates[self.metadata_panel_output] = gr.HTML(value=self.get_audio_info_html(file_path), visible=True)
+                updates[self.metadata_panel_output] = gr.HTML(value=self.get_audio_info_html(file_path, current_state), visible=True)
             else:
                 updates[self.metadata_panel_output] = gr.HTML(value=self.get_video_info_html(current_state, file_path), visible=True)
 
